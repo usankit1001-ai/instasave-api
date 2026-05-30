@@ -24,22 +24,12 @@ const rateLimit = require('express-rate-limit');
 
 // ─── 1. API-KEY BOOTSTRAP (no external service needed) ───────────────────────
 
-let API_KEY = process.env.API_KEY;
-if (!API_KEY) {
-  API_KEY = crypto.randomBytes(32).toString('hex');
-  console.log('\n╔══════════════════════════════════════════════════════════╗');
-  console.log('║  InstaSave API — First Boot Key Generation               ║');
-  console.log('╠══════════════════════════════════════════════════════════╣');
-  console.log('║                                                          ║');
-  console.log(`║  API_KEY=${API_KEY.slice(0, 24)}...  ║`);
-  console.log('║                                                          ║');
-  console.log('║  → Copy the FULL key below and add it in Render.com     ║');
-  console.log('║    Dashboard → Environment → API_KEY = <key>            ║');
-  console.log('║  → Then redeploy so the key survives restarts.          ║');
-  console.log('║                                                          ║');
-  console.log('╚══════════════════════════════════════════════════════════╝');
-  console.log(`\nFULL KEY: API_KEY=${API_KEY}\n`);
-}
+// Fallback key used when no API_KEY env var is set (e.g. first deploy).
+// The Android app is pre-configured with this key.
+const DEFAULT_KEY = 'b4fc4efbf972ddd28753c4d315fd9437daa4c04747efd0e7223075da55b0f8d3';
+
+let API_KEY = process.env.API_KEY || DEFAULT_KEY;
+console.log(`\n[InstaSave API] Starting… API_KEY starts with: ${API_KEY.slice(0, 8)}...\n`);
 
 const PORT = process.env.PORT || 3000;
 
@@ -305,6 +295,7 @@ app.get('/', (_req, res) => {
     service: 'InstaSave API',
     version: '1.0.0',
     strategies: ['og_meta', 'ld_json', 'a1_endpoint', 'shared_data', 'graphql'],
+    key_hint: API_KEY.slice(0, 8) + '...',
   });
 });
 
