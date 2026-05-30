@@ -3,36 +3,20 @@
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const rateLimit = require('express-rate-limit');
-const YTDlpWrap = require('yt-dlp-wrap').default;
 
 // ─── API Key ──────────────────────────────────────────────────────────────────
 const DEFAULT_KEY = 'b4fc4efbf972ddd28753c4d315fd9437daa4c04747efd0e7223075da55b0f8d3';
 const API_KEY = process.env.API_KEY || DEFAULT_KEY;
 const PORT = process.env.PORT || 3000;
 
-console.log(`\n[InstaSave] Starting… key prefix: ${API_KEY.slice(0, 8)}...\n`);
-
-// ─── yt-dlp Setup ─────────────────────────────────────────────────────────────
-const YTDLP_BIN = path.join(__dirname, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
-let ytDlp = null;
-let ytDlpReady = false;
-
-async function initYtDlp() {
-  try {
-    if (!fs.existsSync(YTDLP_BIN)) {
-      console.log('[yt-dlp] Downloading binary (first run only)…');
-      await YTDlpWrap.downloadFromGithub(YTDLP_BIN);
-    }
-    ytDlp = new YTDlpWrap(YTDLP_BIN);
-    ytDlpReady = true;
-    console.log('[yt-dlp] Ready ✓');
-  } catch (err) {
-    console.error('[yt-dlp] Init failed:', err.message);
-  }
-}
+// ─── yt-dlp binary path (downloaded during Render build) ─────────────────────
+const YTDLP_BIN = path.join(__dirname, 'yt-dlp');
+const ytdlpAvailable = fs.existsSync(YTDLP_BIN);
+console.log(`[yt-dlp] binary ${ytdlpAvailable ? 'found ✓' : 'NOT found — skipping yt-dlp strategy'}`);
 
 // ─── Express ──────────────────────────────────────────────────────────────────
 const app = express();
@@ -74,51 +58,59 @@ function isLoginRedirect(url = '') {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function unescape(s) {
-  return s.replace(/\\u0026/g, '&').replace(/\\\//g, '/').replace(/\\n/g, '').replace(/\\/g, '');
+  return (s || '').replace(/\\u0026/g, '&').replace(/\\\//g, '/').replace(/\\n/g, '').replace(/\\/g, '');
 }
 
-// ─── Strategy 1: yt-dlp (most reliable) ──────────────────────────────────────
+// ─── Strategy 1: yt-dlp via execFile ─────────────────────────────────────────
 async function tryYtDlp(postUrl) {
-  if (!ytDlpReady || !ytDlp) return null;
+  if (!ytdlpAvailable) return null;
 
-  const metadata = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('yt-dlp timed out')), 40_000);
-    ytDlp.getVideoInfo([postUrl, '--no-playlist', '--socket-timeout', '20'])
-      .then(d => { clearTimeout(timer); resolve(d); })
-      .catch(e => { clearTimeout(timer); reject(e); });
+  return new Promise((resolve, reject) => {
+    execFile(
+      YTDLP_BIN,
+      ['--dump-json', '--no-playlist', '--socket-timeout', '20', postUrl],
+      { timeout: 40_000, maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err) return reject(new Error(stderr || err.message));
+        try {
+          const data = JSON.parse(stdout.trim());
+
+          // Pick best video URL
+          let videoUrl = data.url || null;
+          if (!videoUrl && Array.isArray(data.formats)) {
+            const videos = data.formats.filter(f => f.url && f.vcodec && f.vcodec !== 'none');
+            const mp4 = videos.filter(f => f.ext === 'mp4');
+            const pool = mp4.length ? mp4 : videos;
+            pool.sort((a, b) => (b.height || 0) - (a.height || 0));
+            videoUrl = pool[0]?.url || null;
+          }
+
+          if (!videoUrl) return resolve(null);
+
+          const desc = data.description || data.title || '';
+          resolve({
+            videoUrl,
+            thumbnail: data.thumbnail || '',
+            title: (data.title || desc).slice(0, 120),
+            description: desc,
+            method: 'yt_dlp',
+          });
+        } catch (e) {
+          reject(e);
+        }
+      }
+    );
   });
-
-  // Get best video URL from formats list
-  let videoUrl = metadata.url || null;
-  if (!videoUrl && Array.isArray(metadata.formats)) {
-    const videos = metadata.formats.filter(f => f.url && f.vcodec && f.vcodec !== 'none');
-    // prefer mp4, pick highest quality
-    const mp4 = videos.filter(f => f.ext === 'mp4');
-    const pool = mp4.length ? mp4 : videos;
-    pool.sort((a, b) => (b.height || 0) - (a.height || 0));
-    videoUrl = pool[0]?.url || null;
-  }
-
-  if (!videoUrl) return null;
-
-  const desc = metadata.description || metadata.title || '';
-  return {
-    videoUrl,
-    thumbnail: metadata.thumbnail || '',
-    title: (metadata.title || desc).slice(0, 120),
-    description: desc,
-    method: 'yt_dlp',
-  };
 }
 
-// ─── Strategy 2: Embed page ───────────────────────────────────────────────────
+// ─── Strategy 2: Instagram embed page ────────────────────────────────────────
 async function tryEmbedPage(shortcode) {
-  const embedUrls = [
+  const urls = [
     `https://www.instagram.com/reel/${shortcode}/embed/captioned/?cr=1&v=14&rd=https%3A%2F%2Fwww.instagram.com`,
     `https://www.instagram.com/p/${shortcode}/embed/captioned/?cr=1&v=14&rd=https%3A%2F%2Fwww.instagram.com`,
   ];
 
-  for (const url of embedUrls) {
+  for (const url of urls) {
     try {
       const res = await axios.get(url, {
         headers: {
@@ -132,17 +124,15 @@ async function tryEmbedPage(shortcode) {
       });
 
       if (isLoginRedirect(res.request?.res?.responseUrl)) continue;
-
       const html = res.data;
 
-      // Look for video URL in JS data / script tags
       const videoPatterns = [
-        /"video_url"\s*:\s*"(https?[^"]+)"/,
-        /"VideoUrl"\s*:\s*"(https?[^"]+)"/,
+        /"video_url"\s*:\s*"(https?[^"\\]+)"/,
+        /"VideoUrl"\s*:\s*"(https?[^"\\]+)"/,
+        /"playable_url"\s*:\s*"(https?[^"\\]+)"/,
+        /"playable_url_quality_hd"\s*:\s*"(https?[^"\\]+)"/,
         /src=\\"(https?[^"\\]+\.mp4[^"\\]*)\\"/,
         /<video[^>]+src="(https?[^"]+)"/,
-        /"playable_url"\s*:\s*"(https?[^"]+)"/,
-        /"playable_url_quality_hd"\s*:\s*"(https?[^"]+)"/,
       ];
 
       for (const pat of videoPatterns) {
@@ -151,18 +141,14 @@ async function tryEmbedPage(shortcode) {
           const videoUrl = unescape(m[1]);
           if (videoUrl.includes('cdninstagram') || videoUrl.includes('fbcdn.net') || videoUrl.includes('.mp4')) {
             const $ = cheerio.load(html);
-            const thumbnail =
-              $('meta[property="og:image"]').attr('content') ||
-              unescape(html.match(/"thumbnail_url"\s*:\s*"(https?[^"]+)"/)?.[1] || '');
-            const title =
-              $('meta[property="og:title"]').attr('content') ||
-              unescape(html.match(/"caption_text"\s*:\s*"([^"]+)"/)?.[1] || '').slice(0, 120);
+            const thumbnail = $('meta[property="og:image"]').attr('content') || '';
+            const title = ($('meta[property="og:title"]').attr('content') || '').slice(0, 120);
             return { videoUrl, thumbnail, title, description: title, method: 'embed_page' };
           }
         }
       }
 
-      // Also try ld+json inside the embed page
+      // Try ld+json in the embed page
       const $ = cheerio.load(html);
       let result = null;
       $('script[type="application/ld+json"]').each((_i, el) => {
@@ -188,7 +174,6 @@ async function tryEmbedPage(shortcode) {
       if (result) return result;
     } catch (err) {
       if (err.code === 'PRIVATE') throw err;
-      // try next embed URL
     }
   }
   return null;
@@ -208,7 +193,7 @@ async function tryOgMeta(shortcode) {
   return {
     videoUrl,
     thumbnail: $('meta[property="og:image"]').attr('content') || '',
-    title: $('meta[property="og:title"]').attr('content') || '',
+    title: ($('meta[property="og:title"]').attr('content') || '').slice(0, 120),
     description: $('meta[property="og:description"]').attr('content') || '',
     method: 'og_meta',
   };
@@ -340,10 +325,10 @@ async function extractVideoInfo(postUrl) {
     try {
       const result = await fn();
       if (result?.videoUrl) {
-        console.log(`[✓] extracted via ${name}  shortcode=${shortcode}`);
+        console.log(`[✓] ${name}  shortcode=${shortcode}`);
         return result;
       }
-      console.log(`[–] ${name}: no videoUrl, trying next`);
+      console.log(`[–] ${name}: no videoUrl`);
     } catch (err) {
       if (err.code === 'PRIVATE') throw err;
       console.log(`[✗] ${name}: ${err.message}`);
@@ -364,7 +349,7 @@ function requireApiKey(req, res, next) {
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 app.get('/', (_req, res) => {
-  res.json({ status: 'ok', service: 'InstaSave API', version: '2.0.0', ytdlp: ytDlpReady });
+  res.json({ status: 'ok', service: 'InstaSave API', version: '2.1.0', ytdlp: ytdlpAvailable });
 });
 
 async function handleExtract(req, res) {
@@ -393,8 +378,6 @@ app.get('/api/extract', requireApiKey, handleExtract);
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`\nInstaSave API v2 running → http://localhost:${PORT}`);
-  console.log(`POST /api/extract  { "url": "https://instagram.com/reel/..." }\n`);
-  // Download yt-dlp in the background after server is ready
-  initYtDlp();
+  console.log(`\nInstaSave API v2.1 → http://localhost:${PORT}`);
+  console.log(`yt-dlp: ${ytdlpAvailable ? 'available' : 'not found'}\n`);
 });

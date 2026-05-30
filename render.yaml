@@ -2,7 +2,7 @@ services:
   - type: web
     name: instasave-api
     env: node
-    buildCommand: npm install
+    buildCommand: npm install && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o ./yt-dlp && chmod +x ./yt-dlp
     startCommand: node insta-api-server.js
     envVars:
       - key: API_KEY
