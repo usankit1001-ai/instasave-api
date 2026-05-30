@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: instasave-api
+    env: node
+    buildCommand: npm install
+    startCommand: node insta-api-server.js
+    envVars:
+      - key: API_KEY
+        generateValue: true
