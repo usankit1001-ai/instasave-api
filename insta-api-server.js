@@ -1,62 +1,55 @@
 'use strict';
 
-/**
- * InstaSave API — insta-api-server.js
- *
- * Zero external API keys required. This server:
- *  1. Self-generates its own API_KEY on first boot (or reads from env).
- *  2. Tries 5 scraping strategies in order, stopping at the first success.
- *  3. Ready to deploy free on Render.com (render.yaml included).
- *
- * Strategies (in order):
- *   1. og:video  — works on most public posts
- *   2. ld+json   — structured data embed
- *   3. ?__a=1    — Instagram's own JSON endpoint
- *   4. _sharedData — window._sharedData inline script
- *   5. GraphQL   — /graphql/query/ public endpoint
- */
-
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const rateLimit = require('express-rate-limit');
+const YTDlpWrap = require('yt-dlp-wrap').default;
 
-// ─── 1. API-KEY BOOTSTRAP (no external service needed) ───────────────────────
-
-// Fallback key used when no API_KEY env var is set (e.g. first deploy).
-// The Android app is pre-configured with this key.
+// ─── API Key ──────────────────────────────────────────────────────────────────
 const DEFAULT_KEY = 'b4fc4efbf972ddd28753c4d315fd9437daa4c04747efd0e7223075da55b0f8d3';
-
-let API_KEY = process.env.API_KEY || DEFAULT_KEY;
-console.log(`\n[InstaSave API] Starting… API_KEY starts with: ${API_KEY.slice(0, 8)}...\n`);
-
+const API_KEY = process.env.API_KEY || DEFAULT_KEY;
 const PORT = process.env.PORT || 3000;
 
-// ─── 2. EXPRESS + MIDDLEWARE ──────────────────────────────────────────────────
+console.log(`\n[InstaSave] Starting… key prefix: ${API_KEY.slice(0, 8)}...\n`);
 
+// ─── yt-dlp Setup ─────────────────────────────────────────────────────────────
+const YTDLP_BIN = path.join(__dirname, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+let ytDlp = null;
+let ytDlpReady = false;
+
+async function initYtDlp() {
+  try {
+    if (!fs.existsSync(YTDLP_BIN)) {
+      console.log('[yt-dlp] Downloading binary (first run only)…');
+      await YTDlpWrap.downloadFromGithub(YTDLP_BIN);
+    }
+    ytDlp = new YTDlpWrap(YTDLP_BIN);
+    ytDlpReady = true;
+    console.log('[yt-dlp] Ready ✓');
+  } catch (err) {
+    console.error('[yt-dlp] Init failed:', err.message);
+  }
+}
+
+// ─── Express ──────────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
+app.use(rateLimit({
+  windowMs: 60_000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (_req, res) => res.status(429).json({ error: 'Too many requests. Please wait a moment.' }),
+}));
 
-app.use(
-  rateLimit({
-    windowMs: 60_000,
-    max: 60,
-    standardHeaders: true,
-    legacyHeaders: false,
-    handler: (_req, res) =>
-      res.status(429).json({ error: 'Too many requests. Please wait a moment.' }),
-  })
-);
-
-// ─── 3. HELPERS ───────────────────────────────────────────────────────────────
-
+// ─── Headers ──────────────────────────────────────────────────────────────────
 const BROWSER_HEADERS = {
-  'User-Agent':
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-    '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   'Accept-Language': 'en-US,en;q=0.9',
-  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
   'Accept-Encoding': 'gzip, deflate, br',
   'Cache-Control': 'no-cache',
   'sec-fetch-dest': 'document',
@@ -64,44 +57,147 @@ const BROWSER_HEADERS = {
   'sec-fetch-site': 'none',
 };
 
-const MOBILE_HEADERS = {
-  'User-Agent':
-    'Instagram 275.0.0.27.98 Android (33/13; 420dpi; 1080x2400; samsung; SM-G991B; o1s; exynos2100; en_US; 458229258)',
-  'Accept-Language': 'en-US',
-  Accept: '*/*',
-  'X-IG-App-ID': '936619743392459',
-  'X-IG-WWW-Claim': '0',
-  Connection: 'keep-alive',
-};
-
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 function extractShortcode(url) {
-  const m = url.match(
-    /(?:instagram\.com|instagr\.am)\/(?:p|reel|tv|reels)\/([A-Za-z0-9_-]+)/
-  );
+  const m = url.match(/(?:instagram\.com|instagr\.am)\/(?:p|reel|tv|reels)\/([A-Za-z0-9_-]+)/);
   return m ? m[1] : null;
 }
 
 function isValidInstagramUrl(url) {
-  return /^https?:\/\/(www\.)?(instagram\.com|instagr\.am)\/(p|reel|tv|reels)\/[A-Za-z0-9_-]+/.test(
-    url.trim()
-  );
+  return /^https?:\/\/(www\.)?(instagram\.com|instagr\.am)\/(p|reel|tv|reels)\/[A-Za-z0-9_-]+/.test(url.trim());
 }
 
-function isLoginRedirect(responseUrl = '') {
-  return responseUrl.includes('/accounts/login/') || responseUrl.includes('/challenge/');
+function isLoginRedirect(url = '') {
+  return url.includes('/accounts/login/') || url.includes('/challenge/');
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ─── 4. SCRAPING STRATEGIES ───────────────────────────────────────────────────
+function unescape(s) {
+  return s.replace(/\\u0026/g, '&').replace(/\\\//g, '/').replace(/\\n/g, '').replace(/\\/g, '');
+}
 
-// Strategy A: og:video meta tag
+// ─── Strategy 1: yt-dlp (most reliable) ──────────────────────────────────────
+async function tryYtDlp(postUrl) {
+  if (!ytDlpReady || !ytDlp) return null;
+
+  const metadata = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('yt-dlp timed out')), 40_000);
+    ytDlp.getVideoInfo([postUrl, '--no-playlist', '--socket-timeout', '20'])
+      .then(d => { clearTimeout(timer); resolve(d); })
+      .catch(e => { clearTimeout(timer); reject(e); });
+  });
+
+  // Get best video URL from formats list
+  let videoUrl = metadata.url || null;
+  if (!videoUrl && Array.isArray(metadata.formats)) {
+    const videos = metadata.formats.filter(f => f.url && f.vcodec && f.vcodec !== 'none');
+    // prefer mp4, pick highest quality
+    const mp4 = videos.filter(f => f.ext === 'mp4');
+    const pool = mp4.length ? mp4 : videos;
+    pool.sort((a, b) => (b.height || 0) - (a.height || 0));
+    videoUrl = pool[0]?.url || null;
+  }
+
+  if (!videoUrl) return null;
+
+  const desc = metadata.description || metadata.title || '';
+  return {
+    videoUrl,
+    thumbnail: metadata.thumbnail || '',
+    title: (metadata.title || desc).slice(0, 120),
+    description: desc,
+    method: 'yt_dlp',
+  };
+}
+
+// ─── Strategy 2: Embed page ───────────────────────────────────────────────────
+async function tryEmbedPage(shortcode) {
+  const embedUrls = [
+    `https://www.instagram.com/reel/${shortcode}/embed/captioned/?cr=1&v=14&rd=https%3A%2F%2Fwww.instagram.com`,
+    `https://www.instagram.com/p/${shortcode}/embed/captioned/?cr=1&v=14&rd=https%3A%2F%2Fwww.instagram.com`,
+  ];
+
+  for (const url of embedUrls) {
+    try {
+      const res = await axios.get(url, {
+        headers: {
+          ...BROWSER_HEADERS,
+          'Referer': 'https://www.instagram.com/',
+          'sec-fetch-dest': 'iframe',
+          'sec-fetch-site': 'same-origin',
+        },
+        maxRedirects: 5,
+        timeout: 15_000,
+      });
+
+      if (isLoginRedirect(res.request?.res?.responseUrl)) continue;
+
+      const html = res.data;
+
+      // Look for video URL in JS data / script tags
+      const videoPatterns = [
+        /"video_url"\s*:\s*"(https?[^"]+)"/,
+        /"VideoUrl"\s*:\s*"(https?[^"]+)"/,
+        /src=\\"(https?[^"\\]+\.mp4[^"\\]*)\\"/,
+        /<video[^>]+src="(https?[^"]+)"/,
+        /"playable_url"\s*:\s*"(https?[^"]+)"/,
+        /"playable_url_quality_hd"\s*:\s*"(https?[^"]+)"/,
+      ];
+
+      for (const pat of videoPatterns) {
+        const m = html.match(pat);
+        if (m) {
+          const videoUrl = unescape(m[1]);
+          if (videoUrl.includes('cdninstagram') || videoUrl.includes('fbcdn.net') || videoUrl.includes('.mp4')) {
+            const $ = cheerio.load(html);
+            const thumbnail =
+              $('meta[property="og:image"]').attr('content') ||
+              unescape(html.match(/"thumbnail_url"\s*:\s*"(https?[^"]+)"/)?.[1] || '');
+            const title =
+              $('meta[property="og:title"]').attr('content') ||
+              unescape(html.match(/"caption_text"\s*:\s*"([^"]+)"/)?.[1] || '').slice(0, 120);
+            return { videoUrl, thumbnail, title, description: title, method: 'embed_page' };
+          }
+        }
+      }
+
+      // Also try ld+json inside the embed page
+      const $ = cheerio.load(html);
+      let result = null;
+      $('script[type="application/ld+json"]').each((_i, el) => {
+        if (result) return;
+        try {
+          const json = JSON.parse($(el).html() || '{}');
+          const items = Array.isArray(json) ? json : [json];
+          for (const obj of items) {
+            const videoUrl = obj.contentUrl || obj.video?.contentUrl ||
+              (Array.isArray(obj.video) ? obj.video[0]?.contentUrl : null);
+            if (videoUrl) {
+              result = {
+                videoUrl,
+                thumbnail: obj.thumbnailUrl || obj.image || '',
+                title: (obj.name || obj.headline || '').slice(0, 120),
+                description: obj.description || '',
+                method: 'embed_ldjson',
+              };
+            }
+          }
+        } catch (_) {}
+      });
+      if (result) return result;
+    } catch (err) {
+      if (err.code === 'PRIVATE') throw err;
+      // try next embed URL
+    }
+  }
+  return null;
+}
+
+// ─── Strategy 3: og:video meta tag ───────────────────────────────────────────
 async function tryOgMeta(shortcode) {
-  const url = `https://www.instagram.com/p/${shortcode}/`;
-  const res = await axios.get(url, {
-    headers: BROWSER_HEADERS,
-    maxRedirects: 5,
-    timeout: 15_000,
+  const res = await axios.get(`https://www.instagram.com/p/${shortcode}/`, {
+    headers: BROWSER_HEADERS, maxRedirects: 5, timeout: 15_000,
   });
   if (isLoginRedirect(res.request?.res?.responseUrl)) {
     throw Object.assign(new Error('Private post'), { code: 'PRIVATE' });
@@ -118,13 +214,10 @@ async function tryOgMeta(shortcode) {
   };
 }
 
-// Strategy B: application/ld+json structured data
+// ─── Strategy 4: ld+json ──────────────────────────────────────────────────────
 async function tryLdJson(shortcode) {
-  const url = `https://www.instagram.com/p/${shortcode}/`;
-  const res = await axios.get(url, {
-    headers: BROWSER_HEADERS,
-    maxRedirects: 5,
-    timeout: 15_000,
+  const res = await axios.get(`https://www.instagram.com/p/${shortcode}/`, {
+    headers: BROWSER_HEADERS, maxRedirects: 5, timeout: 15_000,
   });
   if (isLoginRedirect(res.request?.res?.responseUrl)) {
     throw Object.assign(new Error('Private post'), { code: 'PRIVATE' });
@@ -137,19 +230,16 @@ async function tryLdJson(shortcode) {
       const json = JSON.parse($(el).html() || '{}');
       const items = Array.isArray(json) ? json : [json];
       for (const obj of items) {
-        const videoUrl =
-          obj.contentUrl ||
-          obj.video?.contentUrl ||
+        const videoUrl = obj.contentUrl || obj.video?.contentUrl ||
           (Array.isArray(obj.video) ? obj.video[0]?.contentUrl : null);
         if (videoUrl) {
           result = {
             videoUrl,
             thumbnail: obj.thumbnailUrl || obj.image || '',
-            title: obj.name || obj.headline || '',
+            title: (obj.name || obj.headline || '').slice(0, 120),
             description: obj.description || '',
             method: 'ld_json',
           };
-          break;
         }
       }
     } catch (_) {}
@@ -157,45 +247,34 @@ async function tryLdJson(shortcode) {
   return result;
 }
 
-// Strategy C: ?__a=1 JSON endpoint (Instagram's internal API)
+// ─── Strategy 5: ?__a=1 ───────────────────────────────────────────────────────
 async function tryA1Endpoint(shortcode) {
-  const url = `https://www.instagram.com/p/${shortcode}/?__a=1&__d=dis`;
-  const res = await axios.get(url, {
+  const res = await axios.get(`https://www.instagram.com/p/${shortcode}/?__a=1&__d=dis`, {
     headers: { ...BROWSER_HEADERS, 'X-Requested-With': 'XMLHttpRequest' },
-    maxRedirects: 5,
-    timeout: 15_000,
+    maxRedirects: 5, timeout: 15_000,
   });
   if (isLoginRedirect(res.request?.res?.responseUrl)) {
     throw Object.assign(new Error('Private post'), { code: 'PRIVATE' });
   }
   const data = res.data;
-  const videoUrl =
-    data?.items?.[0]?.video_url ||
-    data?.graphql?.shortcode_media?.video_url;
+  const videoUrl = data?.items?.[0]?.video_url || data?.graphql?.shortcode_media?.video_url;
   if (!videoUrl) return null;
-  const caption =
-    data?.items?.[0]?.caption?.text ||
-    data?.graphql?.shortcode_media?.edge_media_to_caption?.edges?.[0]?.node?.text ||
-    '';
+  const caption = data?.items?.[0]?.caption?.text ||
+    data?.graphql?.shortcode_media?.edge_media_to_caption?.edges?.[0]?.node?.text || '';
   return {
     videoUrl,
-    thumbnail:
-      data?.items?.[0]?.image_versions2?.candidates?.[0]?.url ||
-      data?.graphql?.shortcode_media?.display_url ||
-      '',
+    thumbnail: data?.items?.[0]?.image_versions2?.candidates?.[0]?.url ||
+      data?.graphql?.shortcode_media?.display_url || '',
     title: caption.slice(0, 120),
     description: caption,
     method: 'a1_endpoint',
   };
 }
 
-// Strategy D: window._sharedData inline script
+// ─── Strategy 6: _sharedData ──────────────────────────────────────────────────
 async function trySharedData(shortcode) {
-  const url = `https://www.instagram.com/p/${shortcode}/`;
-  const res = await axios.get(url, {
-    headers: BROWSER_HEADERS,
-    maxRedirects: 5,
-    timeout: 15_000,
+  const res = await axios.get(`https://www.instagram.com/p/${shortcode}/`, {
+    headers: BROWSER_HEADERS, maxRedirects: 5, timeout: 15_000,
   });
   if (isLoginRedirect(res.request?.res?.responseUrl)) {
     throw Object.assign(new Error('Private post'), { code: 'PRIVATE' });
@@ -216,16 +295,13 @@ async function trySharedData(shortcode) {
   };
 }
 
-// Strategy E: Instagram GraphQL public query endpoint
+// ─── Strategy 7: GraphQL ──────────────────────────────────────────────────────
 async function tryGraphQL(shortcode) {
-  const QUERY_HASH = '2b0673e0dc4580674a88d426fe00ea90'; // shortcode_media hash
-  const url =
-    `https://www.instagram.com/graphql/query/?query_hash=${QUERY_HASH}` +
-    `&variables=${encodeURIComponent(JSON.stringify({ shortcode }))}`;
+  const QUERY_HASH = '2b0673e0dc4580674a88d426fe00ea90';
+  const url = `https://www.instagram.com/graphql/query/?query_hash=${QUERY_HASH}&variables=${encodeURIComponent(JSON.stringify({ shortcode }))}`;
   const res = await axios.get(url, {
     headers: { ...BROWSER_HEADERS, 'X-Requested-With': 'XMLHttpRequest' },
-    maxRedirects: 5,
-    timeout: 15_000,
+    maxRedirects: 5, timeout: 15_000,
   });
   if (isLoginRedirect(res.request?.res?.responseUrl)) {
     throw Object.assign(new Error('Private post'), { code: 'PRIVATE' });
@@ -242,13 +318,14 @@ async function tryGraphQL(shortcode) {
   };
 }
 
-// ─── 5. MASTER EXTRACTOR ──────────────────────────────────────────────────────
-
+// ─── Master Extractor ─────────────────────────────────────────────────────────
 async function extractVideoInfo(postUrl) {
   const shortcode = extractShortcode(postUrl);
   if (!shortcode) throw new Error('Could not parse shortcode from URL');
 
   const strategies = [
+    { name: 'yt_dlp',      fn: () => tryYtDlp(postUrl) },
+    { name: 'embed_page',  fn: () => tryEmbedPage(shortcode) },
     { name: 'og_meta',     fn: () => tryOgMeta(shortcode) },
     { name: 'ld_json',     fn: () => tryLdJson(shortcode) },
     { name: 'a1_endpoint', fn: () => tryA1Endpoint(shortcode) },
@@ -259,25 +336,24 @@ async function extractVideoInfo(postUrl) {
   let lastErr = null;
   for (let i = 0; i < strategies.length; i++) {
     const { name, fn } = strategies[i];
-    if (i > 0) await sleep(800); // polite gap between retries
+    if (i > 0) await sleep(500);
     try {
       const result = await fn();
       if (result?.videoUrl) {
         console.log(`[✓] extracted via ${name}  shortcode=${shortcode}`);
         return result;
       }
-      console.log(`[–] ${name}: no videoUrl found, trying next`);
+      console.log(`[–] ${name}: no videoUrl, trying next`);
     } catch (err) {
-      if (err.code === 'PRIVATE') throw err; // stop immediately for private posts
+      if (err.code === 'PRIVATE') throw err;
       console.log(`[✗] ${name}: ${err.message}`);
       lastErr = err;
     }
   }
-  throw lastErr || new Error('All 5 extraction strategies failed');
+  throw lastErr || new Error('All extraction strategies failed');
 }
 
-// ─── 6. AUTH MIDDLEWARE ───────────────────────────────────────────────────────
-
+// ─── Auth Middleware ──────────────────────────────────────────────────────────
 function requireApiKey(req, res, next) {
   const key = req.headers['x-api-key'] || req.query.api_key;
   if (!key || key !== API_KEY) {
@@ -286,32 +362,17 @@ function requireApiKey(req, res, next) {
   next();
 }
 
-// ─── 7. ROUTES ────────────────────────────────────────────────────────────────
-
-// Health check — no auth required
+// ─── Routes ───────────────────────────────────────────────────────────────────
 app.get('/', (_req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'InstaSave API',
-    version: '1.0.0',
-    strategies: ['og_meta', 'ld_json', 'a1_endpoint', 'shared_data', 'graphql'],
-    key_hint: API_KEY.slice(0, 8) + '...',
-  });
+  res.json({ status: 'ok', service: 'InstaSave API', version: '2.0.0', ytdlp: ytDlpReady });
 });
 
-// Shared handler for POST /api/extract and GET /api/extract
 async function handleExtract(req, res) {
   const url = (req.method === 'POST' ? req.body?.url : req.query?.url) || '';
-
-  if (!url) {
-    return res.status(400).json({ error: 'Missing required field: url' });
-  }
+  if (!url) return res.status(400).json({ error: 'Missing required field: url' });
   if (!isValidInstagramUrl(url)) {
-    return res.status(400).json({
-      error: 'Invalid Instagram URL. Must be /p/, /reel/, /tv/, or /reels/ link.',
-    });
+    return res.status(400).json({ error: 'Invalid Instagram URL. Must be /p/, /reel/, /tv/, or /reels/ link.' });
   }
-
   try {
     const data = await extractVideoInfo(url.trim());
     return res.json({ success: true, data });
@@ -320,25 +381,20 @@ async function handleExtract(req, res) {
       return res.status(403).json({ error: 'This post is private or requires login.' });
     }
     if (err.response?.status === 429) {
-      return res.status(429).json({
-        error: 'Instagram is rate-limiting this server. Try again in a minute.',
-      });
+      return res.status(429).json({ error: 'Instagram is rate-limiting this server. Try again in a minute.' });
     }
     console.error('[fatal]', err.message);
-    return res.status(500).json({
-      error: 'All extraction strategies failed.',
-      detail: err.message,
-    });
+    return res.status(500).json({ error: 'All extraction strategies failed.', detail: err.message });
   }
 }
 
 app.post('/api/extract', requireApiKey, handleExtract);
 app.get('/api/extract', requireApiKey, handleExtract);
 
-// ─── 8. START ─────────────────────────────────────────────────────────────────
-
+// ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`\nInstaSave API running → http://localhost:${PORT}`);
-  console.log(`POST /api/extract  { "url": "https://instagram.com/reel/..." }`);
-  console.log(`Header required:   x-api-key: ${API_KEY.slice(0, 8)}...\n`);
+  console.log(`\nInstaSave API v2 running → http://localhost:${PORT}`);
+  console.log(`POST /api/extract  { "url": "https://instagram.com/reel/..." }\n`);
+  // Download yt-dlp in the background after server is ready
+  initYtDlp();
 });
